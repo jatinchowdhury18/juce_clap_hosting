@@ -127,9 +127,12 @@ public:
     // In this example, we don't actually pass any audio through the inner processor.
     // In a 'real' plugin, we'd need to add some synchronisation to ensure that the inner
     // plugin instance was never modified (deleted, replaced etc.) during a call to processBlock.
-    void processBlock (AudioBuffer<float>&, MidiBuffer&) override
+    void processBlock (AudioBuffer<float>& buffer, MidiBuffer& midi) override
     {
         jassert (! isUsingDoublePrecision());
+
+        if (inner != nullptr)
+            inner->processBlock (buffer, midi);
     }
 
     void processBlock (AudioBuffer<double>&, MidiBuffer&) override

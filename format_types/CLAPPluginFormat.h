@@ -2,9 +2,8 @@
 
 namespace juce
 {
-
 /**
-    Implements a plugin format for VST3s.
+    Implements a plugin format for CLAPs.
     @tags{Audio}
 */
 class JUCE_API CLAPPluginFormat   : public AudioPluginFormat

@@ -3,6 +3,9 @@
 #include "juce_core/native/juce_mac_CFHelpers.h" // CFUniquePtr
 
 #include <clap/clap.h>
+#include <clap/helpers/event-list.hh>
+#include <clap/helpers/reducing-param-queue.hh>
+#include <clap/helpers/reducing-param-queue.hxx>
 
 namespace juce {
     namespace juce_clap_helpers {
@@ -285,149 +288,137 @@ namespace juce {
     }
 
     //==============================================================================
-    class CLAPPluginInstance final  : public AudioPluginInstance
+    class CLAPPluginInstance final  : public AudioPluginInstance,
+                                      private Timer
     {
-    public:
-//        //==============================================================================
-//        struct VST3Parameter final  : public Parameter
-//        {
-//            VST3Parameter (VST3PluginInstance& parent,
-//                           Steinberg::int32 vstParameterIndex,
-//                           Steinberg::Vst::ParamID parameterID,
-//                           bool parameterIsAutomatable)
-//                    : pluginInstance (parent),
-//                      vstParamIndex (vstParameterIndex),
-//                      paramID (parameterID),
-//                      automatable (parameterIsAutomatable)
-//            {
-//            }
-//
-//            float getValue() const override
-//            {
-//                return pluginInstance.cachedParamValues.get (vstParamIndex);
-//            }
-//
-//            /*  The 'normal' setValue call, which will update both the processor and editor.
-//            */
-//            void setValue (float newValue) override
-//            {
-//                pluginInstance.cachedParamValues.set (vstParamIndex, newValue);
-//            }
-//
-//            /*  If we're syncing the editor to the processor, the processor won't need to
-//                be notified about the parameter updates, so we can avoid flagging the
-//                change when updating the float cache.
-//            */
-//            void setValueWithoutUpdatingProcessor (float newValue)
-//            {
-//                pluginInstance.cachedParamValues.setWithoutNotifying (vstParamIndex, newValue);
-//                sendValueChangedMessageToListeners (newValue);
-//            }
-//
-//            String getText (float value, int maximumLength) const override
-//            {
-//                MessageManagerLock lock;
-//
-//                if (pluginInstance.editController != nullptr)
-//                {
-//                    Vst::String128 result;
-//
-//                    if (pluginInstance.editController->getParamStringByValue (paramID, value, result) == kResultOk)
-//                        return toString (result).substring (0, maximumLength);
-//                }
-//
-//                return Parameter::getText (value, maximumLength);
-//            }
-//
-//            float getValueForText (const String& text) const override
-//            {
-//                MessageManagerLock lock;
-//
-//                if (pluginInstance.editController != nullptr)
-//                {
-//                    Vst::ParamValue result;
-//
-//                    if (pluginInstance.editController->getParamValueByString (paramID, toString (text), result) == kResultOk)
-//                        return (float) result;
-//                }
-//
-//                return Parameter::getValueForText (text);
-//            }
-//
-//            float getDefaultValue() const override
-//            {
-//                return (float) getParameterInfo().defaultNormalizedValue;
-//            }
-//
-//            String getName (int /*maximumStringLength*/) const override
-//            {
-//                return toString (getParameterInfo().title);
-//            }
-//
-//            String getLabel() const override
-//            {
-//                return toString (getParameterInfo().units);
-//            }
-//
-//            bool isAutomatable() const override
-//            {
-//                return automatable;
-//            }
-//
-//            bool isDiscrete() const override
-//            {
-//                return discrete;
-//            }
-//
-//            int getNumSteps() const override
-//            {
-//                return numSteps;
-//            }
-//
-//            StringArray getAllValueStrings() const override
-//            {
-//                return {};
-//            }
-//
-//            String getParameterID() const override
-//            {
-//                return String (paramID);
-//            }
-//
-//            Steinberg::Vst::ParamID getParamID() const noexcept { return paramID; }
-//
-//        private:
-//            Vst::ParameterInfo getParameterInfo() const
-//            {
-//                return pluginInstance.getParameterInfoForIndex (vstParamIndex);
-//            }
-//
-//            VST3PluginInstance& pluginInstance;
-//            const Steinberg::int32 vstParamIndex;
-//            const Steinberg::Vst::ParamID paramID;
-//            const bool automatable;
-//            const int numSteps = [&]
-//            {
-//                auto stepCount = getParameterInfo().stepCount;
-//                return stepCount == 0 ? AudioProcessor::getDefaultNumParameterSteps()
-//                                      : stepCount + 1;
-//            }();
-//            const bool discrete = getNumSteps() != AudioProcessor::getDefaultNumParameterSteps();
-//        };
-//
+        struct HostToPluginParamQueueValue {
+            void *cookie;
+            double value;
+        };
 
-    private:
-        clap_host host;
-        const clap_plugin *_plugin = nullptr;
-        const clap_plugin_params *_pluginParams = nullptr;
-        const clap_plugin_quick_controls *_pluginQuickControls = nullptr;
-        const clap_plugin_audio_ports *_pluginAudioPorts = nullptr;
-        const clap_plugin_gui *_pluginGui = nullptr;
-        const clap_plugin_timer_support *_pluginTimerSupport = nullptr;
-        const clap_plugin_posix_fd_support *_pluginPosixFdSupport = nullptr;
-        const clap_plugin_thread_pool *_pluginThreadPool = nullptr;
-        const clap_plugin_preset_load *_pluginPresetLoad = nullptr;
-        const clap_plugin_state *_pluginState = nullptr;
+        struct PluginToHostParamQueueValue {
+            void update(const PluginToHostParamQueueValue& v) noexcept {
+                if (v.has_value) {
+                    has_value = true;
+                    value = v.value;
+                }
+
+                if (v.has_gesture) {
+                    has_gesture = true;
+                    is_begin = v.is_begin;
+                }
+            }
+
+            bool has_value = false;
+            bool has_gesture = false;
+            bool is_begin = false;
+            float value = 0;
+        };
+
+        clap::helpers::ReducingParamQueue<clap_id, HostToPluginParamQueueValue> hostToPluginParamQueue;
+        clap::helpers::ReducingParamQueue<clap_id, PluginToHostParamQueueValue> pluginToHostParamQueue;
+
+    public:
+        //==============================================================================
+        struct  CLAPParameter final : public Parameter
+        {
+            CLAPParameter (clap_param_info pInfo,
+                           const clap_plugin_params* pluginPs,
+                           const clap_plugin* plug,
+                           clap::helpers::ReducingParamQueue<clap_id, HostToPluginParamQueueValue>& paramQueue) : paramInfo (pInfo),
+                                                      pluginParams (pluginPs),
+                                                      plugin (plug)
+            {
+                createParamChangeEvent = [&paramQueue] (clap_id id, void* cookie, double val)
+                {
+                    paramQueue.set(id, {cookie, val});
+                    paramQueue.producerDone();
+                    // @TODO: request param flush here...
+                };
+            }
+
+            float getValue() const override
+            {
+                double value {};
+                pluginParams->get_value (plugin, paramInfo.id, &value);
+                return (float) value;
+            }
+
+            void setValue (float newValue) override
+            {
+                createParamChangeEvent (paramInfo.id, paramInfo.cookie, (double) newValue);
+            }
+
+            /*  If we're syncing the editor to the processor, the processor won't need to
+                be notified about the parameter updates, so we can avoid flagging the
+                change when updating the float cache.
+            */
+            void setValueWithoutUpdatingProcessor (float newValue)
+            {
+                sendValueChangedMessageToListeners (newValue);
+            }
+
+            String getText (float value, int maxLength) const override
+            {
+                std::vector<char> display ((size_t) maxLength);
+
+                pluginParams->value_to_text (plugin, paramInfo.id, (double) value, display.data(), (uint32_t) maxLength);
+
+                return String { display.data(), (size_t) maxLength };
+            }
+
+            float getValueForText (const String& text) const override
+            {
+                double value {};
+                pluginParams->text_to_value (plugin, paramInfo.id, text.toRawUTF8(), &value);
+                return (float) value;
+            }
+
+            float getDefaultValue() const override
+            {
+                return (float) paramInfo.default_value;
+            }
+
+            String getName (int /*maximumStringLength*/) const override
+            {
+                return String { paramInfo.name };
+            }
+
+            String getLabel() const override
+            {
+                return {}; // @TODO
+            }
+
+            bool isAutomatable() const override
+            {
+                return paramInfo.flags & CLAP_PARAM_IS_AUTOMATABLE;
+            }
+
+            bool isDiscrete() const override
+            {
+                return paramInfo.flags & CLAP_PARAM_IS_STEPPED;
+            }
+
+            int getNumSteps() const override
+            {
+                return 100;  // @TODO
+            }
+
+            StringArray getAllValueStrings() const override
+            {
+                return {};
+            }
+
+            String getParameterID() const override
+            {
+                return String (paramInfo.id);
+            }
+
+            clap_param_info paramInfo;
+            const clap_plugin_params* pluginParams;
+            const clap_plugin* plugin;
+            std::function<void (clap_id, void*, double)> createParamChangeEvent;
+        };
 
     public:
         //==============================================================================
@@ -440,12 +431,12 @@ namespace juce {
             host.version = "0.0.1";
             host.vendor = "clap";
             host.url = "https://github.com/free-audio/clap";
-//            host.get_extension = PluginHost::clapExtension;
-//            host.request_callback = PluginHost::clapRequestCallback;
-//            host.request_process = PluginHost::clapRequestProcess;
-//            host.request_restart = PluginHost::clapRequestRestart;
+            host.get_extension = CLAPPluginInstance::clapExtension;
+            host.request_callback = CLAPPluginInstance::clapRequestCallback;
+            host.request_process = CLAPPluginInstance::clapRequestProcess;
+            host.request_restart = CLAPPluginInstance::clapRequestRestart;
 
-            _plugin = factory->create_plugin (factory, &host, clapID);
+            plugin = factory->create_plugin (factory, &host, clapID);
         }
 
         ~CLAPPluginInstance() override
@@ -459,7 +450,7 @@ namespace juce {
 
             releaseResources();
 
-            _plugin->destroy (_plugin);
+            plugin->destroy (plugin);
         }
 
         //==============================================================================
@@ -468,11 +459,22 @@ namespace juce {
             // The CLAP spec mandates that initialization is called on the main thread.
             JUCE_ASSERT_MESSAGE_THREAD
 
-            if (_plugin == nullptr)
+            if (plugin == nullptr)
                 return false;
 
-            if (! _plugin->init (_plugin))
+            if (! plugin->init (plugin))
                 return false;
+
+            initPluginExtension(pluginParams, CLAP_EXT_PARAMS);
+            initPluginExtension(pluginAudioPorts, CLAP_EXT_AUDIO_PORTS);
+            initPluginExtension(pluginGui, CLAP_EXT_GUI);
+            initPluginExtension(pluginTimerSupport, CLAP_EXT_TIMER_SUPPORT);
+            initPluginExtension(pluginPosixFdSupport, CLAP_EXT_POSIX_FD_SUPPORT);
+            initPluginExtension(pluginState, CLAP_EXT_STATE);
+
+            refreshParameterList();
+
+            startTimerHz (10); // @TODO: what's a good value here?
 
             return true;
         }
@@ -515,7 +517,7 @@ namespace juce {
         //==============================================================================
         const String getName() const override
         {
-            return _plugin->desc->name;
+            return plugin->desc->name;
         }
 
         void prepareToPlay (double newSampleRate, int estimatedSamplesPerBlock) override
@@ -526,12 +528,14 @@ namespace juce {
             MessageManagerLock lock;
 
             setRateAndBufferSizeDetails (newSampleRate, estimatedSamplesPerBlock);
-            _plugin->activate (_plugin, newSampleRate, 1, (uint32_t) estimatedSamplesPerBlock);
+            plugin->activate (plugin, newSampleRate, 1, (uint32_t) estimatedSamplesPerBlock);
+            plugin->start_processing (plugin);
         }
 
         void releaseResources() override
         {
-            _plugin->deactivate (_plugin);
+            plugin->stop_processing (plugin);
+            plugin->deactivate (plugin);
         }
 
 //        bool supportsDoublePrecisionProcessing() const override
@@ -542,12 +546,130 @@ namespace juce {
         //==============================================================================
         void processBlock (AudioBuffer<float>& buffer, MidiBuffer& midiMessages) override
         {
-//            jassert (! isUsingDoublePrecision());
-//
-//            const SpinLock::ScopedLockType processLock (processMutex);
-//
-//            if (isActive && processor != nullptr)
-//                processAudio (buffer, midiMessages, Vst::kSample32, false);
+            jassert (! isUsingDoublePrecision());
+
+//            const SpinLock::ScopedLockType processLock (processMutex); // I don't want to do this, but I will if I have to...
+
+            // @TODO: check for active state...
+            clap_audio_buffer clapBuffer {};
+            clapBuffer.channel_count = (uint32_t) buffer.getNumChannels();
+            clapBuffer.constant_mask = 0;
+            clapBuffer.data32 = buffer.getArrayOfWritePointers();
+            clapBuffer.data64 = nullptr;
+            clapBuffer.latency = 0; // @TODO
+
+            clap_process processState {};
+            processState.in_events = eventsIn.clapInputEvents();
+            processState.out_events = eventsOut.clapOutputEvents();
+            processState.frames_count = (uint32_t) buffer.getNumSamples();
+            processState.steady_time = -1; // @TODO
+            processState.transport = nullptr; // @TODO
+
+            processState.audio_inputs = &clapBuffer;
+            processState.audio_inputs_count = 1;
+            processState.audio_outputs = &clapBuffer;
+            processState.audio_outputs_count = 1;
+
+            eventsOut.clear();
+            generatePluginInputEvents();
+
+            const auto status = plugin->process (plugin, &processState);
+            ignoreUnused (status); // @TODO: figure out what to do with status
+
+            handlePluginOutputEvents();
+
+            eventsIn.clear();
+            eventsOut.clear();
+
+            pluginToHostParamQueue.producerDone();
+        }
+
+        void generatePluginInputEvents() {
+            hostToPluginParamQueue.consume (
+                    [this](clap_id param_id, const HostToPluginParamQueueValue& value) {
+                        clap_event_param_value ev {};
+                        ev.header.time = 0;
+                        ev.header.type = CLAP_EVENT_PARAM_VALUE;
+                        ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                        ev.header.flags = 0;
+                        ev.header.size = sizeof(ev);
+                        ev.param_id = param_id;
+                        ev.cookie = value.cookie;
+                        ev.port_index = 0;
+                        ev.key = -1;
+                        ev.channel = -1;
+                        ev.note_id = -1;
+                        ev.value = value.value;
+                        eventsIn.push (&ev.header);
+                    });
+        }
+
+        void handlePluginOutputEvents()
+        {
+            for (uint32_t i = 0; i < eventsOut.size(); ++i) {
+                auto h = eventsOut.get(i);
+                switch (h->type) {
+                    case CLAP_EVENT_PARAM_GESTURE_BEGIN: {
+                        auto ev = reinterpret_cast<const clap_event_param_gesture *>(h);
+
+                        PluginToHostParamQueueValue v;
+                        v.has_gesture = true;
+                        v.is_begin = true;
+                        pluginToHostParamQueue.setOrUpdate(ev->param_id, v);
+                        break;
+                    }
+
+                    case CLAP_EVENT_PARAM_GESTURE_END: {
+                        auto ev = reinterpret_cast<const clap_event_param_gesture *>(h);
+
+                        PluginToHostParamQueueValue v;
+                        v.has_gesture = true;
+                        v.is_begin = false;
+                        pluginToHostParamQueue.setOrUpdate(ev->param_id, v);
+                        break;
+                    }
+
+                    case CLAP_EVENT_PARAM_VALUE: {
+                        auto ev = reinterpret_cast<const clap_event_param_value *>(h);
+                        PluginToHostParamQueueValue v;
+                        v.has_value = true;
+                        v.value = (float) ev->value;
+                        pluginToHostParamQueue.setOrUpdate(ev->param_id, v);
+                        break;
+                    }
+                }
+            }
+        }
+
+        void timerCallback() override
+        {
+            // Try to send events to the audio engine
+            hostToPluginParamQueue.producerDone();
+
+            pluginToHostParamQueue.consume(
+                    [this](clap_id param_id, const PluginToHostParamQueueValue &value) {
+                        auto it = paramMap.find(param_id);
+                        if (it == paramMap.end()) {
+                            // Plugin produced a CLAP_EVENT_PARAM_SET with an unknown param_id
+                            jassertfalse;
+                            return;
+                        }
+
+                        if (value.has_value)
+                            it->second->setValueWithoutUpdatingProcessor (value.value);
+
+                        if (value.has_gesture)
+                        {
+                            if (value.is_begin)
+                                it->second->beginChangeGesture();
+                            else
+                                it->second->endChangeGesture();
+                        }
+                    });
+
+            // @TODO: run previously schedlued param flush
+            // @TODO: run oreviously scheduled main thread callback
+            // @TODO: run previously scheduled  restart
         }
 
         void processBlock (AudioBuffer<double>& buffer, MidiBuffer& midiMessages) override
@@ -667,15 +789,70 @@ namespace juce {
         //==============================================================================
         AudioProcessorEditor* createEditor() override
         {
-//            if (auto* view = tryCreatingView())
-//                return new VST3PluginWindow (this, view);
+            auto getCurrentClapGuiApi = [] {
+#if JUCE_LINUX
+                return CLAP_WINDOW_API_X11;
+#elif JUCE_WINDOWS
+                return CLAP_WINDOW_API_WIN32;
+#elif JUCE_MAC
+                return CLAP_WINDOW_API_COCOA;
+#else
+#   error "unsupported platform"
+#endif
+            };
 
-            return nullptr;
+            auto makeClapWindow = [] (Component& window) -> clap_window {
+                clap_window w;
+#if JUCE_LINUX
+                w.api = CLAP_WINDOW_API_X11;
+                w.x11 = window.getWindowHandle();
+#elif JUCE_MAC
+                w.api = CLAP_WINDOW_API_COCOA;
+                w.cocoa = reinterpret_cast<clap_nsview>(window.getWindowHandle());
+#elif JUCE_WINDOWS
+                w.api = CLAP_WINDOW_API_WIN32;
+                w.win32 = reinterpret_cast<clap_hwnd>(window.getWindowHandle());
+#endif
+                return w;
+            };
+
+//            if (! pluginGui->is_api_supported (plugin, getCurrentClapGuiApi(), false));
+//                return nullptr;
+//
+//            class Editor : public AudioProcessorEditor
+//            {
+//            public:
+//                explicit Editor (CLAPPluginInstance& plugin) : AudioProcessorEditor (plugin) {}
+//            };
+//
+//            auto* comp = new Editor { *this };
+//            auto w = makeClapWindow (*comp);
+//
+//            pluginGui->set_transient(plugin, &w);
+//            pluginGui->suggest_title(plugin, "using clap-host suggested title");
+//
+//            pluginGui->set_parent(plugin, &w);
+//
+//            return comp;
+            struct DummyEditor : GenericAudioProcessorEditor
+            {
+                explicit DummyEditor (AudioProcessor& p) : GenericAudioProcessorEditor (p) {}
+
+                ~DummyEditor() override
+                {
+                    getAudioProcessor()->editorBeingDeleted (this);
+                }
+            };
+
+            return new DummyEditor (*this); // @TODO
         }
 
         bool hasEditor() const override
         {
-            return false;
+            if (pluginGui == nullptr)
+                return false;
+
+            return true;
 //            // (if possible, avoid creating a second instance of the editor, because that crashes some plugins)
 //            if (getActiveEditor() != nullptr)
 //                return true;
@@ -769,7 +946,7 @@ namespace juce {
         //==============================================================================
         void fillInPluginDescription (PluginDescription& description) const override
         {
-            juce_clap_helpers::fillDescription (description, _plugin->desc);
+            juce_clap_helpers::fillDescription (description, plugin->desc);
         }
 
 //        /** @note Not applicable to VST3 */
@@ -783,7 +960,220 @@ namespace juce {
 //        {
 //            ignoreUnused (data, sizeInBytes);
 //        }
-//
+
+    private:
+        clap_host host {};
+        const clap_plugin *plugin = nullptr;
+        const clap_plugin_params *pluginParams = nullptr;
+        const clap_plugin_audio_ports *pluginAudioPorts = nullptr;
+        const clap_plugin_gui *pluginGui = nullptr;
+        const clap_plugin_timer_support *pluginTimerSupport = nullptr;
+        const clap_plugin_posix_fd_support *pluginPosixFdSupport = nullptr;
+        const clap_plugin_state *pluginState = nullptr;
+
+        clap::helpers::EventList eventsIn;
+        clap::helpers::EventList eventsOut;
+
+        static CLAPPluginInstance *fromHost(const clap_host *host)
+        {
+            jassert (host != nullptr);
+
+            auto* h = static_cast<CLAPPluginInstance *>(host->host_data);
+            jassert (h != nullptr);
+            jassert (h->plugin != nullptr);
+
+            return h;
+        }
+
+        template <typename T>
+        void initPluginExtension(const T *&ext, const char *id)
+        {
+            // plugin extensions need to be initialized on the main thread
+            jassert (MessageManager::existsAndIsCurrentThread());
+
+            if (!ext)
+                ext = static_cast<const T *>(plugin->get_extension(plugin, id));
+        }
+
+        static void clapRequestCallback(const clap_host *host) {
+            auto h = fromHost(host);
+//            h->_scheduleMainThreadCallback = true; // @TODO
+        }
+
+        static void clapRequestProcess(const clap_host *host) {
+            auto h = fromHost(host);
+//            h->_scheduleProcess = true; // @TODO
+        }
+
+        static void clapRequestRestart(const clap_host *host) {
+            auto h = fromHost(host);
+//            h->_scheduleRestart = true; // @TODO
+        }
+
+        static const void *clapExtension(const clap_host *host, const char *extension) {
+            ignoreUnused(host);
+            jassert (MessageManager::existsAndIsCurrentThread());
+
+//            if (!strcmp(extension, CLAP_EXT_GUI))
+//                return &h->_hostGui;
+            if (!strcmp(extension, CLAP_EXT_LOG))
+                return &juce::CLAPPluginInstance::hostLog;
+//            if (!strcmp(extension, CLAP_EXT_THREAD_CHECK))
+//                return &h->_hostThreadCheck;
+//            if (!strcmp(extension, CLAP_EXT_THREAD_POOL))
+//                return &h->_hostThreadPool;
+//            if (!strcmp(extension, CLAP_EXT_TIMER_SUPPORT))
+//                return &h->_hostTimerSupport;
+//            if (!strcmp(extension, CLAP_EXT_POSIX_FD_SUPPORT))
+//                return &h->_hostPosixFdSupport;
+            if (!strcmp(extension, CLAP_EXT_PARAMS))
+                return &juce::CLAPPluginInstance::hostParams;
+//            if (!strcmp(extension, CLAP_EXT_STATE))
+//                return &h->_hostState;
+            return nullptr;
+        }
+
+        /* clap host callbacks */
+        static void clapLog(const clap_host *host, clap_log_severity severity, const char *msg)
+        {
+            ignoreUnused (host);
+
+            switch (severity) {
+                case CLAP_LOG_DEBUG:
+                case CLAP_LOG_INFO:
+                case CLAP_LOG_WARNING:
+                case CLAP_LOG_ERROR:
+                case CLAP_LOG_FATAL:
+                case CLAP_LOG_HOST_MISBEHAVING:
+                default:
+                    Logger::writeToLog (msg);
+                    break;
+            }
+        }
+
+        std::unordered_map<clap_id, CLAPParameter*> paramMap {};
+        clap_param_rescan_flags paramRescanFlags { CLAP_INVALID_ID };
+        static const constexpr clap_host_log hostLog = {
+                CLAPPluginInstance::clapLog,
+        };
+
+        void refreshParameterList() override
+        {
+            if (pluginParams == nullptr)
+                return;
+
+            if (paramRescanFlags == CLAP_INVALID_ID)
+                paramRescanFlags = CLAP_PARAM_RESCAN_ALL;
+
+            // @TODOD 1. it is forbidden to use CLAP_PARAM_RESCAN_ALL if the plugin is active
+//            if (h->isPluginActive() && (flags & CLAP_PARAM_RESCAN_ALL)) {
+//                throw std::logic_error(
+//                        "clap_host_params.recan(CLAP_PARAM_RESCAN_ALL) was called while the plugin is active!");
+//                return;
+//            }
+
+            const auto count = pluginParams->count (plugin);
+            std::unordered_set<clap_id> paramIds (count * 2);
+            AudioProcessorParameterGroup newParameterTree;
+
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                clap_param_info info {};
+
+                if (! pluginParams->get_info (plugin, i, &info))
+                {
+                    // Unable to get info for this parameter!
+                    jassertfalse;
+                    continue;
+                }
+
+                if (info.id == CLAP_INVALID_ID)
+                {
+                    // parameter has an invalid ID
+                    jassertfalse;
+                    continue;
+                }
+
+                if (paramIds.count (info.id) > 0)
+                {
+                    // parameter is declared twice??
+                    jassertfalse;
+                    return;
+                }
+
+                const auto existingParamIter = paramMap.find (info.id);
+                paramIds.insert (info.id);
+
+                if (existingParamIter == paramMap.end()) // adding a new parameter
+                {
+                    // the plugin should only be adding new parameters when rescanning all of them
+                    jassert (paramRescanFlags & CLAP_PARAM_RESCAN_ALL);
+
+                    auto newParam = std::make_unique<CLAPParameter> (info, pluginParams, plugin, hostToPluginParamQueue);
+                    paramMap.insert_or_assign (info.id, newParam.get());
+                    newParameterTree.addChild (std::move (newParam));
+                }
+                else // updating an existing parameter
+                {
+                    //  @TODO: there's probably more to do here...
+                    existingParamIter->second->paramInfo = info;
+                }
+
+            }
+
+            // remove parameters which are now gone...
+            for (auto iter = paramMap.begin(); iter != paramMap.end();)
+            {
+                if (paramIds.find (iter->first) != paramIds.end())
+                {
+                    if (paramRescanFlags & CLAP_PARAM_RESCAN_ALL)
+                    {
+                        auto newParam = std::make_unique<CLAPParameter> (iter->second->paramInfo, pluginParams, plugin, hostToPluginParamQueue);
+                        paramMap.insert_or_assign (iter->first, newParam.get());
+                        newParameterTree.addChild (std::move (newParam));
+                    }
+                    ++iter;
+                }
+                else
+                {
+                    // a parameter was removed, but the flag CLAP_PARAM_RESCAN_ALL was not specified
+                    jassert (paramRescanFlags & CLAP_PARAM_RESCAN_ALL);
+                    iter = paramMap.erase (iter);
+                }
+            }
+
+            if (paramRescanFlags & CLAP_PARAM_RESCAN_ALL)
+                setHostedParameterTree (std::move (newParameterTree));
+
+            paramRescanFlags = CLAP_INVALID_ID;
+        }
+
+        static void clapParamsRescan(const clap_host *host, clap_param_rescan_flags flags)
+        {
+            jassert (MessageManager::existsAndIsCurrentThread());
+
+            // @TODO: do something smarter based on the flags
+            ignoreUnused (flags);
+            auto h = fromHost(host);
+            h->paramRescanFlags = flags;
+            h->refreshParameterList();
+        }
+
+        static void clapParamsClear (const clap_host *host, clap_id param_id, clap_param_clear_flags flags)
+        {
+            // @TODO
+        }
+
+        static void clapParamsRequestFlush(const clap_host *host)
+        {
+            // @TODO
+        }
+
+        static const constexpr clap_host_params hostParams = {
+                CLAPPluginInstance::clapParamsRescan,
+                CLAPPluginInstance::clapParamsClear,
+                CLAPPluginInstance::clapParamsRequestFlush,
+        };
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CLAPPluginInstance)
     };

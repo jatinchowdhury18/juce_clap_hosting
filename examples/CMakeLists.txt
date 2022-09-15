@@ -1,14 +1,8 @@
 set(CMAKE_CXX_STANDARD 20)
 
 CPMAddPackage(
-    NAME clap
-    GIT_REPOSITORY https://github.com/free-audio/clap.git
-    GIT_TAG 1.1.1
-)
-
-CPMAddPackage(
-    NAME clap-helpers
-    GIT_REPOSITORY https://github.com/free-audio/clap-helpers.git
+    NAME clap-juce-extensions
+    GIT_REPOSITORY https://github.com/free-audio/clap-juce-extensions.git
     GIT_TAG main
 )
 
@@ -52,4 +46,10 @@ target_link_libraries(TestHostPlugin
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
+)
+
+clap_juce_extensions_plugin(
+    TARGET TestHostPlugin
+    CLAP_ID "org.chowdsp.test_hosting"
+    CLAP_FEATURES audio-effect testing
 )
