@@ -422,8 +422,8 @@ namespace juce {
 
     public:
         //==============================================================================
-        explicit CLAPPluginInstance (const clap_plugin_factory* factory, const char* clapID)
-                : AudioPluginInstance (BusesProperties{})
+        explicit CLAPPluginInstance (const clap_plugin_factory* factory, const char* clapID, const File& file)
+                : AudioPluginInstance (BusesProperties{}), pluginFile (file)
         {
             host.host_data = this;
             host.clap_version = CLAP_VERSION;
@@ -889,64 +889,71 @@ namespace juce {
         //==============================================================================
         void getStateInformation (MemoryBlock& destData) override
         {
-//            // The VST3 plugin format requires that get/set state calls are made
-//            // from the message thread.
-//            // We'll lock the message manager here as a safety precaution, but some
-//            // plugins may still misbehave!
-//
-//            JUCE_ASSERT_MESSAGE_THREAD
-//            MessageManagerLock lock;
-//
-//            parameterDispatcher.flush();
-//
-//            XmlElement state ("VST3PluginState");
-//
-//            appendStateFrom (state, holder->component, "IComponent");
-//            appendStateFrom (state, editController, "IEditController");
-//
-//            AudioProcessor::copyXmlToBinary (state, destData);
+            struct OutputStream {
+                MemoryBlock& data;
+
+                explicit OutputStream (MemoryBlock& d) : data (d) {
+                    data.reset();
+                }
+
+                static int64_t write (const clap_ostream *stream, const void *buffer, uint64_t size)
+                {
+                    auto os = static_cast <const OutputStream*> (stream->ctx);
+                    jassert (os != nullptr);
+                    os->data.append (buffer, size);
+                    return (int64_t) size;
+                }
+            };
+
+            if (pluginState == nullptr)
+                return; // plugin does not support state!
+
+            OutputStream os { destData };
+            clap_ostream clapStream {
+                &os,
+                &OutputStream::write,
+            };
+            pluginState->save (plugin, &clapStream);
         }
 
         void setStateInformation (const void* data, int sizeInBytes) override
         {
-//            // The VST3 plugin format requires that get/set state calls are made
-//            // from the message thread.
-//            // We'll lock the message manager here as a safety precaution, but some
-//            // plugins may still misbehave!
-//
-//            JUCE_ASSERT_MESSAGE_THREAD
-//            MessageManagerLock lock;
-//
-//            parameterDispatcher.flush();
-//
-//            if (auto head = AudioProcessor::getXmlFromBinary (data, sizeInBytes))
-//            {
-//                auto componentStream (createMemoryStreamForState (*head, "IComponent"));
-//
-//                if (componentStream != nullptr && holder->component != nullptr)
-//                    holder->component->setState (componentStream);
-//
-//                if (editController != nullptr)
-//                {
-//                    if (componentStream != nullptr)
-//                    {
-//                        int64 result;
-//                        componentStream->seek (0, IBStream::kIBSeekSet, &result);
-//                        setComponentStateAndResetParameters (*componentStream);
-//                    }
-//
-//                    auto controllerStream (createMemoryStreamForState (*head, "IEditController"));
-//
-//                    if (controllerStream != nullptr)
-//                        editController->setState (controllerStream);
-//                }
-//            }
+            if (pluginState == nullptr)
+                return; // plugin does not support state!
+
+            struct InputStream {
+                MemoryBlock data;
+                int bytesCount = 0;
+
+                explicit InputStream (const void* d, int size) : data (d,  (size_t) size) {}
+
+                static int64_t read (const clap_istream *stream, void *buffer, uint64_t size)
+                {
+                    auto is = static_cast <InputStream*> (stream->ctx);
+                    jassert (is != nullptr);
+
+                    int bytesToRead = jmin ((int) size, (int) is->data.getSize() - is->bytesCount);
+                    if (bytesToRead <= 0)
+                        return 0;
+
+                    is->data.copyTo (buffer, is->bytesCount, (size_t) bytesToRead);
+                    is->bytesCount += bytesToRead;
+                    return bytesToRead;
+                }
+            };
+
+            InputStream is { data, sizeInBytes };
+            clap_istream clapStream {
+                    &is,
+                    &InputStream::read,
+            };
+            pluginState->load (plugin, &clapStream);
         }
 
         //==============================================================================
         void fillInPluginDescription (PluginDescription& description) const override
         {
-            juce_clap_helpers::fillDescription (description, plugin->desc);
+            juce_clap_helpers::createPluginDescription (description, pluginFile, plugin->desc, getMainBusNumInputChannels(), getMainBusNumOutputChannels());
         }
 
 //        /** @note Not applicable to VST3 */
@@ -973,6 +980,8 @@ namespace juce {
 
         clap::helpers::EventList eventsIn;
         clap::helpers::EventList eventsOut;
+
+        const File pluginFile;
 
         static CLAPPluginInstance *fromHost(const clap_host *host)
         {
@@ -1017,19 +1026,17 @@ namespace juce {
 //            if (!strcmp(extension, CLAP_EXT_GUI))
 //                return &h->_hostGui;
             if (!strcmp(extension, CLAP_EXT_LOG))
-                return &juce::CLAPPluginInstance::hostLog;
+                return &CLAPPluginInstance::hostLog;
 //            if (!strcmp(extension, CLAP_EXT_THREAD_CHECK))
 //                return &h->_hostThreadCheck;
-//            if (!strcmp(extension, CLAP_EXT_THREAD_POOL))
-//                return &h->_hostThreadPool;
 //            if (!strcmp(extension, CLAP_EXT_TIMER_SUPPORT))
 //                return &h->_hostTimerSupport;
 //            if (!strcmp(extension, CLAP_EXT_POSIX_FD_SUPPORT))
 //                return &h->_hostPosixFdSupport;
             if (!strcmp(extension, CLAP_EXT_PARAMS))
-                return &juce::CLAPPluginInstance::hostParams;
-//            if (!strcmp(extension, CLAP_EXT_STATE))
-//                return &h->_hostState;
+                return &CLAPPluginInstance::hostParams;
+            if (!strcmp(extension, CLAP_EXT_STATE))
+                return &CLAPPluginInstance::hostState;
             return nullptr;
         }
 
@@ -1051,7 +1058,7 @@ namespace juce {
             }
         }
 
-        std::unordered_map<clap_id, CLAPParameter*> paramMap {};
+        std::map<clap_id, CLAPParameter*> paramMap {};
         clap_param_rescan_flags paramRescanFlags { CLAP_INVALID_ID };
         static const constexpr clap_host_log hostLog = {
                 CLAPPluginInstance::clapLog,
@@ -1175,6 +1182,17 @@ namespace juce {
                 CLAPPluginInstance::clapParamsRequestFlush,
         };
 
+        static void clapMarkDirty (const clap_host* host)
+        {
+            jassert (MessageManager::existsAndIsCurrentThread());
+            auto h = fromHost (host);
+            h->updateHostDisplay (AudioPluginInstance::ChangeDetails{}.withNonParameterStateChanged (true));
+        }
+
+        static const constexpr clap_host_state hostState {
+            CLAPPluginInstance::clapMarkDirty,
+        };
+
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CLAPPluginInstance)
     };
 
@@ -1231,7 +1249,7 @@ namespace juce {
             {
                 if (juce_clap_helpers::getHashForRange (std::string (clapDesc->id)) == description.uniqueId)
                 {
-                    auto pluginInstance = std::make_unique<CLAPPluginInstance>(pluginFactory, clapDesc->id);
+                    auto pluginInstance = std::make_unique<CLAPPluginInstance>(pluginFactory, clapDesc->id, file);
 
                     if (pluginInstance->initialise())
                         return pluginInstance;
