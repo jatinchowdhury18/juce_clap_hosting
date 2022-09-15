@@ -529,6 +529,7 @@ namespace juce {
 
             setRateAndBufferSizeDetails (newSampleRate, estimatedSamplesPerBlock);
             plugin->activate (plugin, newSampleRate, 1, (uint32_t) estimatedSamplesPerBlock);
+            isPluginActive = true;
             plugin->start_processing (plugin);
         }
 
@@ -536,6 +537,7 @@ namespace juce {
         {
             plugin->stop_processing (plugin);
             plugin->deactivate (plugin);
+            isPluginActive = false;
         }
 
 //        bool supportsDoublePrecisionProcessing() const override
@@ -668,8 +670,16 @@ namespace juce {
                     });
 
             // @TODO: run previously schedlued param flush
-            // @TODO: run oreviously scheduled main thread callback
-            // @TODO: run previously scheduled  restart
+
+            if (scheduleMainThreadCallback.compareAndSetBool (false, true))
+                plugin->on_main_thread (plugin);
+
+            if (scheduleRestart.compareAndSetBool (false, true))
+            {
+                if (isPluginActive)
+                    releaseResources();
+                prepareToPlay (getSampleRate(), getBlockSize());
+            }
         }
 
         void processBlock (AudioBuffer<double>& buffer, MidiBuffer& midiMessages) override
@@ -978,10 +988,14 @@ namespace juce {
         const clap_plugin_posix_fd_support *pluginPosixFdSupport = nullptr;
         const clap_plugin_state *pluginState = nullptr;
 
+        bool isPluginActive { false };
         clap::helpers::EventList eventsIn;
         clap::helpers::EventList eventsOut;
 
         const File pluginFile;
+
+        Atomic<bool> scheduleMainThreadCallback { false };
+        Atomic<bool> scheduleRestart { false };
 
         static CLAPPluginInstance *fromHost(const clap_host *host)
         {
@@ -1006,7 +1020,7 @@ namespace juce {
 
         static void clapRequestCallback(const clap_host *host) {
             auto h = fromHost(host);
-//            h->_scheduleMainThreadCallback = true; // @TODO
+            h->scheduleMainThreadCallback.set (true);
         }
 
         static void clapRequestProcess(const clap_host *host) {
